@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cswilliams.hilton-monitor</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__VENV_PY__</string>
+    <string>__SCRIPT__</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__WORKDIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NTFY_TOPIC</key>
+    <string>__NTFY_TOPIC__</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
+
+  <!-- Every 2 hours (7200 seconds) -->
+  <key>StartInterval</key>
+  <integer>7200</integer>
+
+  <!-- Run once at load so first check happens immediately -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__WORKDIR__/logs/monitor.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__WORKDIR__/logs/monitor.err.log</string>
+
+  <!-- Don't run if the Mac is on battery and getting low (optional but polite) -->
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

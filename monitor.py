@@ -153,40 +153,57 @@ _NOT_OPEN = [
     "no longer accepting",
     "we are unable to find a hotel",
 ]
+# "no rooms" signals — only meaningful when "rooms found" is ABSENT, because
+# Hilton's pages display partial sold-out copy like "10 rooms found. 3 are
+# currently sold out." even when inventory exists.
 _NO_ROOMS = [
-    "no rooms available",
-    "no availability",
-    "sold out",
-    "no rates available",
-    "no hotel rooms were found",
-    "there are no rooms",
+    "sorry, we don't have any rooms available",
+    "we don't have any rooms available for those dates",
+    "no rooms available for the selected dates",
+    "no rooms match your criteria",
     "we are unable to find rates",
-    "no rooms match",
+    "no hotel rooms were found",
+    "we couldn't find any rooms",
+    "0 rooms available",
 ]
 
-# Concrete price-like patterns we expect on a real rate-loaded page.
+_ROOMS_FOUND  = re.compile(r"\b(\d+)\s+rooms?\s+found\b", re.IGNORECASE)
 _PRICE_PATTERN = re.compile(r"\$\s?\d{2,4}\b|\d{2,4}\s?usd", re.IGNORECASE)
 _PER_NIGHT     = re.compile(r"\bper\s+night\b|/\s*night\b|avg/?\s*night", re.IGNORECASE)
+_WAF_MARKER    = re.compile(r"hilton page reference code|something went wrong",
+                            re.IGNORECASE)
 
 
 def _classify_text(text: str) -> Optional[Avail]:
     """
-    Tight classifier:
-      - 'not open' wins first (strongest signal)
-      - 'no rooms' wins second
-      - AVAILABLE only if we see BOTH a $ price AND a /night marker AND
-        not a 'no rooms' message (avoids matching marketing copy)
+    Hilton-aware classifier (in priority order):
+      1. WAF/error page → UNKNOWN (None) so caller can decide
+      2. DATES_NOT_OPEN signals
+      3. "rooms found" with N>0 → TWO_ROOMS
+      4. Explicit "no rooms ..." copy (specific phrases) → NO_ROOMS
+      5. Price + per-night signals → TWO_ROOMS
+      6. Otherwise None (inconclusive)
     """
     t = text.lower()
 
+    # WAF / generic Hilton error page — not a valid signal in either direction.
+    waf_hits = len(_WAF_MARKER.findall(t))
+    if waf_hits >= 1 and "rooms found" not in t and "select a room" not in t:
+        return None
+
     if any(s in t for s in _NOT_OPEN):
         return Avail.DATES_NOT_OPEN
+
+    m = _ROOMS_FOUND.search(t)
+    if m and int(m.group(1)) > 0:
+        return Avail.TWO_ROOMS
+
     if any(s in t for s in _NO_ROOMS):
         return Avail.NO_ROOMS
 
-    price_hits   = len(_PRICE_PATTERN.findall(text))
-    night_hits   = len(_PER_NIGHT.findall(text))
-    if price_hits >= 1 and night_hits >= 1:
+    price_hits = len(_PRICE_PATTERN.findall(text))
+    night_hits = len(_PER_NIGHT.findall(text))
+    if price_hits >= 2 and night_hits >= 2:
         return Avail.TWO_ROOMS
 
     return None
@@ -211,10 +228,11 @@ def _extract_json_blobs(html: str) -> list[dict]:
 
 
 def _classify_json(data: dict) -> Optional[Avail]:
-    s = json.dumps(data).lower()
-    if "datesnotavailable" in s or "advancebooking" in s:
-        return Avail.DATES_NOT_OPEN
-
+    """
+    Conservative classifier: only return a definitive answer when the JSON
+    clearly contains real room/rate data. Top-level empty arrays are
+    inconclusive (Next.js __NEXT_DATA__ has empty placeholder fields).
+    """
     rooms = (
         data.get("rooms")
         or data.get("roomTypes")
@@ -222,27 +240,23 @@ def _classify_json(data: dict) -> Optional[Avail]:
         or data.get("roomRates")
         or []
     )
-    if not isinstance(rooms, list):
-        return None
-    if len(rooms) == 0:
-        if "notavailable" in s or "norooms" in s:
-            return Avail.NO_ROOMS
+    if not isinstance(rooms, list) or len(rooms) == 0:
         return None
 
     bookable = [
         r for r in rooms
         if isinstance(r, dict) and (
-            r.get("availableRooms", 1) > 0
-            or r.get("inventory", 1) > 0
-            or "rate" in r
-            or "price" in r
+            r.get("availableRooms", 0) > 0
+            or r.get("inventory", 0) > 0
+            or r.get("rate")
+            or r.get("price")
         )
     ]
     if len(bookable) >= 2:
         return Avail.TWO_ROOMS
     if len(bookable) == 1:
         return Avail.ONE_ROOM
-    return Avail.NO_ROOMS
+    return None  # don't say NO_ROOMS from JSON; let text classifier decide
 
 
 # ── API approach ──────────────────────────────────────────────────────────────
@@ -281,93 +295,80 @@ def check_via_api(arrival: date, departure: date) -> Optional[Avail]:
     return _classify_text(html)
 
 
-# ── Playwright fallback ───────────────────────────────────────────────────────
+# ── Browser fallback (patchright + persistent Chrome profile) ─────────────────
+#
+# Hilton's Akamai WAF detects standard Playwright Chrome. patchright +
+# real Chrome (channel="chrome") + a persistent profile + the
+# AutomationControlled flag disabled gets past it. We run "headed" but
+# position the window off-screen so it's invisible to the user.
 
-def _apply_stealth(page) -> bool:
-    """Apply playwright-stealth; supports v1.x (stealth_sync) and v2.x (Stealth)."""
-    try:
-        from playwright_stealth import stealth_sync  # v1.x
-        stealth_sync(page)
-        return True
-    except ImportError:
-        pass
-    try:
-        from playwright_stealth import Stealth  # v2.x
-        Stealth().apply_stealth_sync(page.context)
-        return True
-    except ImportError:
-        pass
-    log.warning("playwright-stealth not available; proceeding without it")
-    return False
+BROWSER_PROFILE = Path(os.environ.get(
+    "HILTON_PROFILE",
+    os.path.expanduser("~/.hilton-monitor-profile"),
+))
 
 
 def check_via_playwright(arrival: date, departure: date) -> Avail:
     try:
-        from playwright.sync_api import sync_playwright
-        from playwright.sync_api import TimeoutError as PWTimeout
+        from patchright.sync_api import sync_playwright
+        from patchright.sync_api import TimeoutError as PWTimeout
     except ImportError:
-        log.error("Playwright not installed.")
+        log.error("patchright not installed. Run: pip install patchright && patchright install chromium")
         return Avail.UNKNOWN
 
     url = booking_url(arrival, departure, num_rooms=2)
     label = f"{arrival.isoformat()}_to_{departure.isoformat()}"
 
+    BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=str(BROWSER_PROFILE),
+            headless=False,                       # Akamai blocks headless
+            channel="chrome",                     # real Chrome, not Chromium
+            viewport={"width": 1400, "height": 900},
             locale="en-US",
             timezone_id="America/New_York",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--window-position=-5000,-5000",  # off-screen, invisible
+            ],
         )
         page = ctx.new_page()
-        _apply_stealth(page)
 
-        # Capture XHR responses so DEBUG mode can show us Hilton's real API calls
-        xhr_log: list[dict] = []
-
-        def _record(resp):
-            try:
-                ct = (resp.headers or {}).get("content-type", "")
-                if "application/json" in ct and resp.request.resource_type in ("xhr", "fetch"):
-                    body_preview = ""
-                    try:
-                        body_preview = resp.text()[:4000]
-                    except Exception:
-                        pass
-                    xhr_log.append({
-                        "url":    resp.url,
-                        "status": resp.status,
-                        "body":   body_preview,
-                    })
-            except Exception:
-                pass
-
-        page.on("response", _record)
-
-        # ── Load page ──────────────────────────────────────────────────────────
-        # Don't wait for networkidle (Hilton's SPA never goes idle).
-        # Use domcontentloaded + fixed wait + best-effort selector wait.
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except PWTimeout:
             log.warning("domcontentloaded timeout for %s", label)
-            browser.close()
+            ctx.close()
             return Avail.UNKNOWN
 
-        # Wait briefly for the SPA to populate rates / error message.
-        page.wait_for_timeout(12000)
+        # Wait for any of the classification signals to appear. Saves time
+        # vs. a fixed-duration sleep on fast loads.
+        try:
+            page.wait_for_function(
+                """() => {
+                    if (!document.body) return false;
+                    const t = (document.body.innerText || '').toLowerCase();
+                    // Wait for definitive page-state signal. Don't wait on
+                    // the bare "no rooms" string — it appears inside hidden
+                    // React components even on bookable pages.
+                    return /\\d+\\s+rooms?\\s+found/.test(t)
+                        || t.includes('hilton page reference code')
+                        || t.includes('not available for booking')
+                        || t.includes('outside the booking window')
+                        || t.includes('we couldn\\'t find any rooms')
+                        || t.includes('no rooms match');
+                }""",
+                timeout=20000,
+            )
+        except PWTimeout:
+            # Fall through and classify whatever rendered.
+            log.debug("no signal selector matched for %s", label)
+            page.wait_for_timeout(3000)
 
         html = page.content()
 
-        # DEBUG: dump artifacts for inspection
         if DEBUG:
             DEBUG_DIR.mkdir(exist_ok=True)
             (DEBUG_DIR / f"{label}.html").write_text(html, encoding="utf-8")
@@ -375,21 +376,20 @@ def check_via_playwright(arrival: date, departure: date) -> Avail:
                 page.screenshot(path=str(DEBUG_DIR / f"{label}.png"), full_page=True)
             except Exception as exc:
                 log.warning("screenshot failed: %s", exc)
-            if xhr_log:
-                (DEBUG_DIR / f"{label}.xhr.json").write_text(
-                    json.dumps(xhr_log, indent=2), encoding="utf-8"
-                )
             log.info("  [DEBUG] artifacts saved to %s/%s.*", DEBUG_DIR, label)
 
-        browser.close()
+        ctx.close()
 
-    # Try JSON blobs first
+    result = _classify_text(html)
+    if result is not None:
+        return result
+
     for blob in _extract_json_blobs(html):
         r = _classify_json(blob)
         if r is not None:
             return r
 
-    return _classify_text(html) or Avail.UNKNOWN
+    return Avail.UNKNOWN
 
 
 # ── Per-window check ──────────────────────────────────────────────────────────

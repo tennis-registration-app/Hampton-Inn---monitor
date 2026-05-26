@@ -5,3 +5,10 @@ __pycache__/
 venv/
 .env
 .DS_Store
+
+# Runtime artifacts
+logs/
+debug/
+
+# Local launchd plist (rendered from template by install_launchd.sh)
+~/Library/LaunchAgents/com.cswilliams.hilton-monitor.plist
