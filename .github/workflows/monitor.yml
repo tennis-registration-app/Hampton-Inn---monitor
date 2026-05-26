@@ -1,0 +1,36 @@
+name: Hilton Availability Monitor
+
+on:
+  schedule:
+    # Runs every 2 hours (UTC).  Adjust the offset to spread load.
+    - cron: '15 */2 * * *'
+  workflow_dispatch:          # allows manual trigger from the Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # Always pre-install Chromium; the script decides at runtime whether
+      # to use it (API approach is tried first).
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run availability monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python monitor.py
