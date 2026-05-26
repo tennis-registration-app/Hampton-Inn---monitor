@@ -57,9 +57,12 @@ if _TEST_ARRIVAL:
     )
     MODE = "TEST"
 else:
-    CHECK_IN_START = date(2027, 5, 22)
-    CHECK_IN_DAYS  = 9
-    STAY_LENGTHS   = [2, 3, 4]
+    # Single representative combo: mid-week, mid-stay-length. Hilton releases
+    # the May 22–30, 2027 booking window as one block, so a single bookable
+    # combo is sufficient to signal that the whole week has opened.
+    CHECK_IN_START = date(2027, 5, 25)
+    CHECK_IN_DAYS  = 1
+    STAY_LENGTHS   = [3]
     MODE = "PROD"
 
 DEBUG_DIR = Path("debug")
@@ -325,7 +328,10 @@ def check_via_playwright(arrival: date, departure: date) -> Avail:
         ctx = pw.chromium.launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE),
             headless=False,                       # Akamai blocks headless
-            channel="chrome",                     # real Chrome, not Chromium
+            # NOTE: intentionally do NOT pass channel="chrome" — using
+            # Playwright's bundled Chromium gives us a separate Bundle ID
+            # from the user's Google Chrome.app, so the Dock icon, Spaces,
+            # and window focus never interact with their normal browser.
             viewport={"width": 1400, "height": 900},
             locale="en-US",
             timezone_id="America/New_York",
