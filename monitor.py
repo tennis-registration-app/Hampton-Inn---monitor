@@ -354,10 +354,12 @@ def check_via_playwright(arrival: date, departure: date) -> Avail:
                     // the bare "no rooms" string — it appears inside hidden
                     // React components even on bookable pages.
                     return /\\d+\\s+rooms?\\s+found/.test(t)
+                        || t.includes("sorry, we don't have any rooms")
+                        || t.includes("we don't have any rooms available")
                         || t.includes('hilton page reference code')
                         || t.includes('not available for booking')
                         || t.includes('outside the booking window')
-                        || t.includes('we couldn\\'t find any rooms')
+                        || t.includes("we couldn't find any rooms")
                         || t.includes('no rooms match');
                 }""",
                 timeout=20000,
