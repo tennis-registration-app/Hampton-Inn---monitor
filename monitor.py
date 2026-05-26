@@ -2,13 +2,21 @@
 """
 Monitor Hampton Inn Lexington Historic District (LXTSWHX) for room availability.
 
-Checks May 22–30, 2027 for 2/3/4 night stays (2 rooms, 2 adults each).
-Sends a push notification via ntfy.sh when any rooms become bookable.
+Default mode (production):
+  Checks May 22–30, 2027 with 2/3/4 night stays (2 rooms, 2 adults each)
+  and sends an ntfy.sh push notification when any rooms become bookable.
+
+Test mode (set via env vars):
+  TEST_ARRIVAL  – override start date (YYYY-MM-DD)
+  TEST_NIGHTS   – override stay lengths, comma-separated (e.g. "2" or "2,3,4")
+  TEST_DAYS     – number of check-in days to scan starting from TEST_ARRIVAL (default 1)
+  SKIP_NOTIFY=1 – classify and log but do not send ntfy notification
+  DEBUG=1       – dump rendered HTML + screenshot per check to ./debug/ for inspection
 
 Failure-state semantics:
-  DATES_NOT_OPEN – booking window hasn't opened yet   → no notification
-  NO_ROOMS       – dates open but no inventory        → no notification
-  ONE_ROOM / TWO_ROOMS – at least one room bookable   → notification sent
+  DATES_NOT_OPEN – booking window hasn't opened yet  → no notification
+  NO_ROOMS       – dates open but no inventory       → no notification
+  ONE_ROOM/TWO_ROOMS – at least one room bookable    → notification sent
 """
 
 import json
@@ -18,8 +26,9 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
+from pathlib import Path
 from typing import Optional
 
 import requests
@@ -30,13 +39,30 @@ from urllib3.util.retry import Retry
 
 CTYHOCN         = "LXTSWHX"
 NTFY_TOPIC      = os.environ.get("NTFY_TOPIC", "")
-
-CHECK_IN_START  = date(2027, 5, 22)
-CHECK_IN_DAYS   = 9          # May 22–30 inclusive
-STAY_LENGTHS    = [2, 3, 4]
+SKIP_NOTIFY     = os.environ.get("SKIP_NOTIFY", "").lower() in ("1", "true", "yes")
+DEBUG           = os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
 ADULTS_PER_ROOM = 2
+REQUEST_DELAY   = 1.5
 
-REQUEST_DELAY   = 1.5        # polite seconds between checks
+# Date range can be overridden for test runs via env vars
+_TEST_ARRIVAL = os.environ.get("TEST_ARRIVAL", "").strip()
+_TEST_NIGHTS  = os.environ.get("TEST_NIGHTS", "").strip()
+_TEST_DAYS    = os.environ.get("TEST_DAYS", "").strip()
+
+if _TEST_ARRIVAL:
+    CHECK_IN_START = datetime.strptime(_TEST_ARRIVAL, "%Y-%m-%d").date()
+    CHECK_IN_DAYS  = int(_TEST_DAYS) if _TEST_DAYS else 1
+    STAY_LENGTHS   = (
+        [int(n.strip()) for n in _TEST_NIGHTS.split(",")] if _TEST_NIGHTS else [2]
+    )
+    MODE = "TEST"
+else:
+    CHECK_IN_START = date(2027, 5, 22)
+    CHECK_IN_DAYS  = 9
+    STAY_LENGTHS   = [2, 3, 4]
+    MODE = "PROD"
+
+DEBUG_DIR = Path("debug")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -51,11 +77,11 @@ log = logging.getLogger(__name__)
 # ── Availability states ───────────────────────────────────────────────────────
 
 class Avail(Enum):
-    DATES_NOT_OPEN = auto()   # booking window not yet open
-    NO_ROOMS       = auto()   # dates open, zero inventory
-    ONE_ROOM       = auto()   # ≥1 room confirmed; 2nd room not confirmed
-    TWO_ROOMS      = auto()   # both rooms confirmed simultaneously
-    UNKNOWN        = auto()   # could not determine
+    DATES_NOT_OPEN = auto()
+    NO_ROOMS       = auto()
+    ONE_ROOM       = auto()
+    TWO_ROOMS      = auto()
+    UNKNOWN        = auto()
 
 
 @dataclass
@@ -113,36 +139,56 @@ def get_session() -> requests.Session:
     return _SESSION
 
 
-# ── Text-classification signals ───────────────────────────────────────────────
+# ── Classifier signals ────────────────────────────────────────────────────────
 
 _NOT_OPEN = [
-    "not available for booking", "dates are not available",
-    "not yet available", "outside the booking window",
-    "maximum advance", "too far in advance",
-    "advance purchase period", "dates unavailable",
-    "cannot be booked", "no longer accepting",
+    "not available for booking",
+    "dates are not available",
+    "not yet available",
+    "outside the booking window",
+    "too far in advance",
+    "maximum advance",
+    "advance purchase period",
+    "cannot be booked",
+    "no longer accepting",
+    "we are unable to find a hotel",
 ]
 _NO_ROOMS = [
-    "no rooms available", "no availability", "sold out",
-    "0 rooms", "no rates available", "no results",
-    "no hotel rooms were found", "we couldn't find",
+    "no rooms available",
+    "no availability",
+    "sold out",
+    "no rates available",
+    "no hotel rooms were found",
     "there are no rooms",
+    "we are unable to find rates",
+    "no rooms match",
 ]
-_AVAILABLE = [
-    "per night", "select room", "book now", "view rate",
-    "add to cart", "/night", "from $", "usd",
-    "choose your room", "room details", "avg/night",
-]
+
+# Concrete price-like patterns we expect on a real rate-loaded page.
+_PRICE_PATTERN = re.compile(r"\$\s?\d{2,4}\b|\d{2,4}\s?usd", re.IGNORECASE)
+_PER_NIGHT     = re.compile(r"\bper\s+night\b|/\s*night\b|avg/?\s*night", re.IGNORECASE)
 
 
 def _classify_text(text: str) -> Optional[Avail]:
+    """
+    Tight classifier:
+      - 'not open' wins first (strongest signal)
+      - 'no rooms' wins second
+      - AVAILABLE only if we see BOTH a $ price AND a /night marker AND
+        not a 'no rooms' message (avoids matching marketing copy)
+    """
     t = text.lower()
+
     if any(s in t for s in _NOT_OPEN):
         return Avail.DATES_NOT_OPEN
-    if any(s in t for s in _AVAILABLE):
-        return Avail.TWO_ROOMS   # optimistic; Playwright refines if needed
     if any(s in t for s in _NO_ROOMS):
         return Avail.NO_ROOMS
+
+    price_hits   = len(_PRICE_PATTERN.findall(text))
+    night_hits   = len(_PER_NIGHT.findall(text))
+    if price_hits >= 1 and night_hits >= 1:
+        return Avail.TWO_ROOMS
+
     return None
 
 
@@ -178,7 +224,6 @@ def _classify_json(data: dict) -> Optional[Avail]:
     )
     if not isinstance(rooms, list):
         return None
-
     if len(rooms) == 0:
         if "notavailable" in s or "norooms" in s:
             return Avail.NO_ROOMS
@@ -200,16 +245,11 @@ def _classify_json(data: dict) -> Optional[Avail]:
     return Avail.NO_ROOMS
 
 
-# ── API approach (preferred) ──────────────────────────────────────────────────
+# ── API approach ──────────────────────────────────────────────────────────────
 
 def check_via_api(arrival: date, departure: date) -> Optional[Avail]:
-    """
-    Attempt availability check via plain HTTP requests.
-    Returns None when the response is inconclusive (SPA shell only).
-    """
     session = get_session()
     url = booking_url(arrival, departure, num_rooms=2)
-
     try:
         resp = session.get(
             url, timeout=20,
@@ -222,49 +262,55 @@ def check_via_api(arrival: date, departure: date) -> Optional[Avail]:
     if resp.status_code == 404:
         return Avail.DATES_NOT_OPEN
     if resp.status_code != 200:
-        log.debug("API returned HTTP %s", resp.status_code)
         return None
 
     if "application/json" in resp.headers.get("Content-Type", ""):
         try:
-            result = _classify_json(resp.json())
-            if result is not None:
-                return result
+            r = _classify_json(resp.json())
+            if r is not None:
+                return r
         except ValueError:
             pass
 
     html = resp.text
-
     for blob in _extract_json_blobs(html):
-        result = _classify_json(blob)
-        if result is not None:
-            return result
+        r = _classify_json(blob)
+        if r is not None:
+            return r
 
     return _classify_text(html)
 
 
 # ── Playwright fallback ───────────────────────────────────────────────────────
 
+def _apply_stealth(page) -> bool:
+    """Apply playwright-stealth; supports v1.x (stealth_sync) and v2.x (Stealth)."""
+    try:
+        from playwright_stealth import stealth_sync  # v1.x
+        stealth_sync(page)
+        return True
+    except ImportError:
+        pass
+    try:
+        from playwright_stealth import Stealth  # v2.x
+        Stealth().apply_stealth_sync(page.context)
+        return True
+    except ImportError:
+        pass
+    log.warning("playwright-stealth not available; proceeding without it")
+    return False
+
+
 def check_via_playwright(arrival: date, departure: date) -> Avail:
-    """Headless Chromium fallback using Playwright + stealth."""
     try:
         from playwright.sync_api import sync_playwright
         from playwright.sync_api import TimeoutError as PWTimeout
     except ImportError:
-        log.error(
-            "Playwright not installed. "
-            "Run: pip install playwright && playwright install chromium"
-        )
+        log.error("Playwright not installed.")
         return Avail.UNKNOWN
 
-    try:
-        from playwright_stealth import stealth_sync
-        has_stealth = True
-    except ImportError:
-        has_stealth = False
-        log.warning("playwright-stealth not found; bot-detection evasion disabled")
-
     url = booking_url(arrival, departure, num_rooms=2)
+    label = f"{arrival.isoformat()}_to_{departure.isoformat()}"
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -282,32 +328,66 @@ def check_via_playwright(arrival: date, departure: date) -> Avail:
             timezone_id="America/New_York",
         )
         page = ctx.new_page()
+        _apply_stealth(page)
 
-        if has_stealth:
-            stealth_sync(page)
+        # Capture XHR responses so DEBUG mode can show us Hilton's real API calls
+        xhr_log: list[dict] = []
 
-        # ── Load the booking page ──────────────────────────────────────────
-        try:
-            page.goto(url, wait_until="networkidle", timeout=55000)
-        except PWTimeout:
-            log.warning("networkidle timeout; retrying with domcontentloaded")
+        def _record(resp):
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(8000)
-            except PWTimeout:
-                log.warning("Page load timed out for %s → %s", arrival, departure)
-                browser.close()
-                return Avail.UNKNOWN
+                ct = (resp.headers or {}).get("content-type", "")
+                if "application/json" in ct and resp.request.resource_type in ("xhr", "fetch"):
+                    body_preview = ""
+                    try:
+                        body_preview = resp.text()[:4000]
+                    except Exception:
+                        pass
+                    xhr_log.append({
+                        "url":    resp.url,
+                        "status": resp.status,
+                        "body":   body_preview,
+                    })
+            except Exception:
+                pass
 
-        # Try to extract JSON from the rendered DOM before falling back to text
-        for blob in _extract_json_blobs(page.content()):
-            result = _classify_json(blob)
-            if result is not None:
-                browser.close()
-                return result
+        page.on("response", _record)
+
+        # ── Load page ──────────────────────────────────────────────────────────
+        # Don't wait for networkidle (Hilton's SPA never goes idle).
+        # Use domcontentloaded + fixed wait + best-effort selector wait.
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except PWTimeout:
+            log.warning("domcontentloaded timeout for %s", label)
+            browser.close()
+            return Avail.UNKNOWN
+
+        # Wait briefly for the SPA to populate rates / error message.
+        page.wait_for_timeout(12000)
 
         html = page.content()
+
+        # DEBUG: dump artifacts for inspection
+        if DEBUG:
+            DEBUG_DIR.mkdir(exist_ok=True)
+            (DEBUG_DIR / f"{label}.html").write_text(html, encoding="utf-8")
+            try:
+                page.screenshot(path=str(DEBUG_DIR / f"{label}.png"), full_page=True)
+            except Exception as exc:
+                log.warning("screenshot failed: %s", exc)
+            if xhr_log:
+                (DEBUG_DIR / f"{label}.xhr.json").write_text(
+                    json.dumps(xhr_log, indent=2), encoding="utf-8"
+                )
+            log.info("  [DEBUG] artifacts saved to %s/%s.*", DEBUG_DIR, label)
+
         browser.close()
+
+    # Try JSON blobs first
+    for blob in _extract_json_blobs(html):
+        r = _classify_json(blob)
+        if r is not None:
+            return r
 
     return _classify_text(html) or Avail.UNKNOWN
 
@@ -320,7 +400,6 @@ def check_dates(arrival: date, departure: date) -> CheckResult:
 
     avail = check_via_api(arrival, departure)
     source = "API"
-
     if avail is None or avail == Avail.UNKNOWN:
         log.info("  API inconclusive → falling back to Playwright")
         avail = check_via_playwright(arrival, departure)
@@ -341,33 +420,28 @@ def check_dates(arrival: date, departure: date) -> CheckResult:
 # ── Notification ──────────────────────────────────────────────────────────────
 
 def send_notification(available: list[CheckResult]) -> None:
+    if SKIP_NOTIFY:
+        log.info("SKIP_NOTIFY set – not sending notification")
+        return
     if not NTFY_TOPIC:
         log.warning("NTFY_TOPIC not set – skipping notification")
         return
 
-    lines = [
-        "Hampton Inn Lexington Historic District rooms available — book now!\n",
-    ]
+    lines = ["Hampton Inn Lexington Historic District rooms available — book now!\n"]
     for r in available:
         nights = (r.departure - r.arrival).days
-        two_flag = (
-            "YES" if r.avail == Avail.TWO_ROOMS
-            else "UNCERTAIN – verify on booking page"
-        )
+        two_flag = "YES" if r.avail == Avail.TWO_ROOMS else "UNCERTAIN – verify on booking page"
         lines.append(f"• {r.arrival} check-in  →  {r.departure} check-out  ({nights} nights)")
         lines.append(f"  2 rooms simultaneously: {two_flag}")
         lines.append(f"  Book: {booking_url(r.arrival, r.departure)}")
         lines.append("")
 
-    body = "\n".join(lines)
-    subject = f"[Hilton LXTSWHX] {len(available)} date window(s) bookable"
-
     try:
         resp = requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=body.encode("utf-8"),
+            data="\n".join(lines).encode("utf-8"),
             headers={
-                "Title":    subject,
+                "Title":    f"[Hilton LXTSWHX] {len(available)} date window(s) bookable",
                 "Priority": "high",
                 "Tags":     "hotel,calendar,bell",
             },
@@ -383,14 +457,16 @@ def send_notification(available: list[CheckResult]) -> None:
 
 def main() -> None:
     log.info("=" * 60)
-    log.info("Hilton LXTSWHX availability monitor")
-    log.info("Hotel : Hampton Inn Lexington Historic District")
-    log.info("Dates : May 22–30, 2027 check-in")
-    log.info("Stays : 2 / 3 / 4 nights  |  2 rooms, 2 adults each")
+    log.info("Hilton LXTSWHX availability monitor  [mode=%s]", MODE)
+    log.info("Hotel  : Hampton Inn Lexington Historic District")
+    log.info("Range  : %s for %d day(s)", CHECK_IN_START, CHECK_IN_DAYS)
+    log.info("Stays  : %s nights  |  2 rooms, 2 adults each",
+             ", ".join(map(str, STAY_LENGTHS)))
+    log.info("Notify : %s", "skipped" if SKIP_NOTIFY else "enabled" if NTFY_TOPIC else "no topic")
+    log.info("Debug  : %s", "ON" if DEBUG else "off")
     log.info("=" * 60)
 
     available: list[CheckResult] = []
-
     for offset in range(CHECK_IN_DAYS):
         arrival = CHECK_IN_START + timedelta(days=offset)
         for nights in STAY_LENGTHS:
@@ -401,12 +477,11 @@ def main() -> None:
             time.sleep(REQUEST_DELAY)
 
     log.info("=" * 60)
-    log.info("Scan complete. Available windows found: %d", len(available))
-
+    log.info("Scan complete. Available windows: %d", len(available))
     if available:
         send_notification(available)
     else:
-        log.info("No rooms found – no notification sent.")
+        log.info("No rooms found – no notification.")
 
 
 if __name__ == "__main__":

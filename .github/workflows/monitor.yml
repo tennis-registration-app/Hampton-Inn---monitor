@@ -1,15 +1,47 @@
 name: Hilton Availability Monitor
 
 on:
-  schedule:
-    # Runs every 2 hours (UTC).  Adjust the offset to spread load.
-    - cron: '15 */2 * * *'
-  workflow_dispatch:          # allows manual trigger from the Actions tab
+  # ──────────────────────────────────────────────────────────────────────────
+  # Cron is PAUSED while we validate the classifier.
+  # Re-enable by uncommenting the schedule block once test runs look correct.
+  # ──────────────────────────────────────────────────────────────────────────
+  # schedule:
+  #   - cron: '15 */2 * * *'   # every 2 hours
+  workflow_dispatch:
+    inputs:
+      arrival:
+        description: 'Test arrival date (YYYY-MM-DD). Leave blank for production scan (May 22–30, 2027).'
+        required: false
+        default: ''
+      nights:
+        description: 'Stay lengths, comma-separated (e.g. "2" or "2,3,4"). Used with arrival.'
+        required: false
+        default: '2'
+      days:
+        description: 'Number of consecutive check-in days starting at arrival (e.g. "1" or "3").'
+        required: false
+        default: '1'
+      skip_notify:
+        description: 'Skip ntfy notification (true/false).'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      debug:
+        description: 'Save rendered HTML / screenshot / XHR log to artifacts.'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository
@@ -25,12 +57,24 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # Always pre-install Chromium; the script decides at runtime whether
-      # to use it (API approach is tried first).
       - name: Install Playwright Chromium
         run: playwright install chromium --with-deps
 
       - name: Run availability monitor
         env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOPIC:   ${{ secrets.NTFY_TOPIC }}
+          TEST_ARRIVAL: ${{ github.event.inputs.arrival }}
+          TEST_NIGHTS:  ${{ github.event.inputs.nights }}
+          TEST_DAYS:    ${{ github.event.inputs.days }}
+          SKIP_NOTIFY:  ${{ github.event.inputs.skip_notify }}
+          DEBUG:        ${{ github.event.inputs.debug }}
         run: python monitor.py
+
+      - name: Upload debug artifacts
+        if: ${{ always() && github.event.inputs.debug == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
