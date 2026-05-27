@@ -37,8 +37,13 @@
   <key>StandardErrorPath</key>
   <string>__WORKDIR__/logs/monitor.err.log</string>
 
-  <!-- Don't run if the Mac is on battery and getting low (optional but polite) -->
-  <key>ProcessType</key>
-  <string>Background</string>
+  <!-- ProcessType deliberately omitted.
+       Earlier we had ProcessType=Background, which causes macOS to
+       throttle and defer the job aggressively (missed intervals during
+       sleep were not catching up on wake). With ProcessType omitted, the
+       job runs at standard priority and fires immediately on wake if an
+       interval was missed. We still keep it light via LowPriorityIO. -->
+  <key>LowPriorityIO</key>
+  <true/>
 </dict>
 </plist>
